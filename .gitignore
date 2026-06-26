@@ -1,0 +1,6 @@
+output/
+*.exe
+go.sum
+ffmpeg.zip
+ffmpeg_extracted/
+dist/
