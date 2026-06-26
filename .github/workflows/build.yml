@@ -1,0 +1,57 @@
+name: Build Windows EXE with ffmpeg
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Build EXE
+        run: go build -ldflags="-H windowsgui" -o RenPyVideoTool.exe .
+
+      - name: Download ffmpeg (static build)
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extracted
+          $binDir = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $binDir.FullName -Destination .
+          $probeDir = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+          Copy-Item $probeDir.FullName -Destination .
+
+      - name: Package everything together
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item RenPyVideoTool.exe dist/
+          Copy-Item ffmpeg.exe dist/
+          Copy-Item ffprobe.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath RenPyVideoTool-windows.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RenPyVideoTool-windows
+          path: RenPyVideoTool-windows.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: RenPyVideoTool-windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
