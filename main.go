@@ -9,28 +9,41 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 )
 
+type fragmentRow struct {
+	startEntry *widget.Entry
+	endEntry   *widget.Entry
+	row        *fyne.Container
+}
+
 var (
 	window fyne.Window
 
-	modeSel       *widget.RadioGroup
-	compressBox   *fyne.Container
-	trimBox       *fyne.Container
+	modeSel     *widget.RadioGroup
+	compressBox *fyne.Container
+	trimBox     *fyne.Container
 
-	resModeSel    *widget.RadioGroup
-	customWEntry  *widget.Entry
-	customHEntry  *widget.Entry
-	cropModeSel   *widget.RadioGroup
-	formatSel     *widget.RadioGroup
-	mirrorSel     *widget.RadioGroup
-	crfSlider     *widget.Slider
-	crfLabel      *widget.Label
-	trimStartEntry *widget.Entry
-	trimEndEntry  *widget.Entry
+	resModeSel   *widget.RadioGroup
+	customWEntry *widget.Entry
+	customHEntry *widget.Entry
+	cropModeSel  *widget.RadioGroup
+	formatSel    *widget.RadioGroup
+	mirrorSel    *widget.RadioGroup
+	crfSlider    *widget.Slider
+	crfLabel     *widget.Label
+
+	fragmentsListBox *fyne.Container
+	fragments        []*fragmentRow
+
+	previewSecEntry *widget.Entry
+	previewImage    *canvas.Image
+	previewStatus   *widget.Label
+
 	progressBar   *widget.ProgressBar
 	statusLabel   *widget.Label
 	fileListLabel *widget.Label
@@ -143,16 +156,6 @@ func getFormat() string {
 	}
 }
 
-func checkFFmpegPresent() bool {
-	if _, err := os.Stat(ffmpegPath()); err != nil {
-		return false
-	}
-	if _, err := os.Stat(ffprobePath()); err != nil {
-		return false
-	}
-	return true
-}
-
 func getMode() string {
 	switch modeSel.Selected {
 	case "Только обрезка (без пересжатия, быстро, без потери качества)":
@@ -163,6 +166,103 @@ func getMode() string {
 		return "compress_only"
 	}
 }
+
+func checkFFmpegPresent() bool {
+	if _, err := os.Stat(ffmpegPath()); err != nil {
+		return false
+	}
+	if _, err := os.Stat(ffprobePath()); err != nil {
+		return false
+	}
+	return true
+}
+
+// ----- управление списком фрагментов -----
+
+func rebuildFragmentsListBox() {
+	objs := make([]fyne.CanvasObject, 0, len(fragments))
+	for _, f := range fragments {
+		objs = append(objs, f.row)
+	}
+	fragmentsListBox.Objects = objs
+	fragmentsListBox.Refresh()
+}
+
+func addFragmentRow() {
+	startEntry := widget.NewEntry()
+	startEntry.SetPlaceHolder("Начало, сек")
+	endEntry := widget.NewEntry()
+	endEntry.SetPlaceHolder("Конец, сек")
+
+	fr := &fragmentRow{startEntry: startEntry, endEntry: endEntry}
+
+	removeBtn := widget.NewButton("Удалить", func() {
+		removeFragmentRow(fr)
+	})
+
+	fr.row = container.NewBorder(nil, nil, nil, removeBtn,
+		container.NewGridWithColumns(2, startEntry, endEntry))
+
+	fragments = append(fragments, fr)
+	rebuildFragmentsListBox()
+}
+
+func removeFragmentRow(target *fragmentRow) {
+	if len(fragments) <= 1 {
+		return // хотя бы один фрагмент должен остаться
+	}
+	newList := make([]*fragmentRow, 0, len(fragments)-1)
+	for _, f := range fragments {
+		if f != target {
+			newList = append(newList, f)
+		}
+	}
+	fragments = newList
+	rebuildFragmentsListBox()
+}
+
+// ----- превью -----
+
+func doPreviewFrame() {
+	if len(selectedFiles) == 0 {
+		dialog.ShowInformation("Нет файла", "Сначала выбери видео.", window)
+		return
+	}
+	if !checkFFmpegPresent() {
+		dialog.ShowInformation("ffmpeg не найден", "ffmpeg.exe должен лежать рядом с программой.", window)
+		return
+	}
+	sec, err := strconv.ParseFloat(strings.TrimSpace(previewSecEntry.Text), 64)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("укажи секунду числом, например 12.5"), window)
+		return
+	}
+
+	previewStatus.SetText("Извлекаю кадр...")
+	go func() {
+		framePath := filepath.Join(os.TempDir(), "renpyvideotool_preview.jpg")
+		err := extractFrame(selectedFiles[0], sec, framePath)
+		if err != nil {
+			previewStatus.SetText("Не удалось извлечь кадр на этой секунде (возможно видео короче).")
+			return
+		}
+		previewImage.File = framePath
+		previewImage.Refresh()
+		previewStatus.SetText(fmt.Sprintf("Кадр на %.2f сек (файл: %s)", sec, filepath.Base(selectedFiles[0])))
+	}()
+}
+
+func doOpenExternalPlayer() {
+	if len(selectedFiles) == 0 {
+		dialog.ShowInformation("Нет файла", "Сначала выбери видео.", window)
+		return
+	}
+	if err := openInDefaultPlayer(selectedFiles[0]); err != nil {
+		dialog.ShowError(err, window)
+	}
+}
+
+// ----- обработка -----
 
 func processFiles() {
 	if len(selectedFiles) == 0 {
@@ -195,66 +295,97 @@ func processFiles() {
 		crf = int(crfSlider.Value)
 	}
 
-	var trimStart, trimEnd float64
+	type frag struct{ start, end float64 }
+	var fragList []frag
+
 	if mode != "compress_only" {
-		trimStart, _ = strconv.ParseFloat(strings.TrimSpace(trimStartEntry.Text), 64)
-		trimEnd, _ = strconv.ParseFloat(strings.TrimSpace(trimEndEntry.Text), 64)
-		if trimEnd <= trimStart {
-			dialog.ShowError(fmt.Errorf("конец фрагмента должен быть больше начала"), window)
+		for idx, f := range fragments {
+			s, errS := strconv.ParseFloat(strings.TrimSpace(f.startEntry.Text), 64)
+			e, errE := strconv.ParseFloat(strings.TrimSpace(f.endEntry.Text), 64)
+			if errS != nil || errE != nil || e <= s {
+				dialog.ShowError(fmt.Errorf("проверь фрагмент №%d: начало/конец указаны неверно", idx+1), window)
+				return
+			}
+			fragList = append(fragList, frag{s, e})
+		}
+		if len(fragList) == 0 {
+			dialog.ShowError(fmt.Errorf("добавь хотя бы один фрагмент для обрезки"), window)
 			return
 		}
+	} else {
+		fragList = []frag{{0, 0}} // заглушка - не используется в compress_only
 	}
 
 	outDir := "output"
 	os.MkdirAll(outDir, 0755)
 
-	total := len(selectedFiles)
+	totalFiles := len(selectedFiles)
+	totalSteps := totalFiles * len(fragList)
+	step := 0
 	var failed []string
 
 	for i, path := range selectedFiles {
 		name := filepath.Base(path)
+		baseName := strings.TrimSuffix(name, filepath.Ext(name))
 
-		var outName string
-		if mode == "trim_only" {
-			// формат не меняется - оставляем исходное расширение
-			outName = strings.TrimSuffix(name, filepath.Ext(name)) + "_cut" + filepath.Ext(name)
-		} else {
-			ext := outExtForFormat(format)
-			outName = strings.TrimSuffix(name, filepath.Ext(name)) + ext
-		}
-		outPath := filepath.Join(outDir, outName)
+		for fi, fr := range fragList {
+			var outName string
+			multiFrag := mode != "compress_only" && len(fragList) > 1
 
-		statusLabel.SetText(fmt.Sprintf("Обрабатываю файл %d/%d: %s — 0%%", i+1, total, name))
-		progressBar.SetValue(float64(i) / float64(total))
+			switch {
+			case mode == "trim_only" && multiFrag:
+				outName = fmt.Sprintf("%s_part%d%s", baseName, fi+1, filepath.Ext(name))
+			case mode == "trim_only":
+				outName = baseName + "_cut" + filepath.Ext(name)
+			case mode == "compress_only":
+				outName = baseName + outExtForFormat(format)
+			case multiFrag:
+				outName = fmt.Sprintf("%s_part%d%s", baseName, fi+1, outExtForFormat(format))
+			default:
+				outName = baseName + "_cut" + outExtForFormat(format)
+			}
 
-		progressCb := func(frac float64) {
-			overall := (float64(i) + frac) / float64(total)
-			progressBar.SetValue(overall)
-			statusLabel.SetText(fmt.Sprintf("Обрабатываю файл %d/%d: %s — %.0f%%", i+1, total, name, frac*100))
-		}
+			outPath := filepath.Join(outDir, outName)
 
-		var err error
-		switch mode {
-		case "trim_only":
-			err = runTrimOnly(path, outPath, trimStart, trimEnd, progressCb)
-		case "compress_only":
-			err = runFFmpeg(path, outPath, targetW, targetH, cropMode, mirrorMode, format, crf,
-				false, 0, 0, progressCb)
-		default: // both
-			err = runFFmpeg(path, outPath, targetW, targetH, cropMode, mirrorMode, format, crf,
-				true, trimStart, trimEnd, progressCb)
-		}
+			label := outName
+			statusLabel.SetText(fmt.Sprintf("Обрабатываю %d/%d: %s — 0%%", step+1, totalSteps, label))
+			progressBar.SetValue(float64(step) / float64(totalSteps))
 
-		if err != nil {
-			failed = append(failed, name)
+			progressCb := func(frac float64) {
+				overall := (float64(step) + frac) / float64(totalSteps)
+				progressBar.SetValue(overall)
+				statusLabel.SetText(fmt.Sprintf("Обрабатываю %d/%d: %s — %.0f%%", step+1, totalSteps, label, frac*100))
+			}
+
+			var err error
+			switch mode {
+			case "trim_only":
+				err = runTrimOnly(path, outPath, fr.start, fr.end, progressCb)
+			case "compress_only":
+				err = runFFmpeg(path, outPath, targetW, targetH, cropMode, mirrorMode, format, crf,
+					false, 0, 0, progressCb)
+			default: // both
+				err = runFFmpeg(path, outPath, targetW, targetH, cropMode, mirrorMode, format, crf,
+					true, fr.start, fr.end, progressCb)
+			}
+
+			if err != nil {
+				failed = append(failed, label)
+			}
+
+			step++
+
+			if mode == "compress_only" {
+				break // для compress_only фрагменты не имеют смысла, обрабатываем файл один раз
+			}
 		}
 	}
 
 	progressBar.SetValue(1)
-	okCount := total - len(failed)
-	statusLabel.SetText(fmt.Sprintf("Готово! Успешно: %d из %d.", okCount, total))
+	okCount := totalSteps - len(failed)
+	statusLabel.SetText(fmt.Sprintf("Готово! Успешно: %d из %d.", okCount, totalSteps))
 
-	msg := fmt.Sprintf("Обработано успешно: %d из %d.\nРезультат сохранён в папку \"output\" рядом с программой.", okCount, total)
+	msg := fmt.Sprintf("Обработано успешно: %d из %d.\nРезультат сохранён в папку \"output\" рядом с программой.", okCount, totalSteps)
 	if len(failed) > 0 {
 		msg += fmt.Sprintf("\n\nНе удалось обработать (%d):\n%s", len(failed), strings.Join(failed, "\n"))
 	}
@@ -264,7 +395,7 @@ func processFiles() {
 func main() {
 	a := app.New()
 	window = a.NewWindow("RenPy Video Tool")
-	window.Resize(fyne.NewSize(560, 700))
+	window.Resize(fyne.NewSize(600, 760))
 
 	fileListLabel = widget.NewLabel("")
 	fileListLabel.Wrapping = fyne.TextWrapWord
@@ -274,6 +405,31 @@ func main() {
 		showFilePicker()
 	})
 
+	// --- превью ---
+	previewSecEntry = widget.NewEntry()
+	previewSecEntry.SetPlaceHolder("Секунда, например 12.5")
+	previewBtn := widget.NewButton("Показать кадр", func() {
+		doPreviewFrame()
+	})
+	externalBtn := widget.NewButton("Открыть в плеере по умолчанию", func() {
+		doOpenExternalPlayer()
+	})
+	previewImage = canvas.NewImageFromFile("")
+	previewImage.FillMode = canvas.ImageFillContain
+	previewImage.SetMinSize(fyne.NewSize(400, 225))
+	previewStatus = widget.NewLabel("Превью первого выбранного файла появится здесь.")
+	previewStatus.Wrapping = fyne.TextWrapWord
+
+	previewRow := container.NewBorder(nil, nil, nil, previewBtn, previewSecEntry)
+	previewBox := container.NewVBox(
+		widget.NewLabel("Превью кадра (по первому выбранному файлу):"),
+		externalBtn,
+		previewRow,
+		previewImage,
+		previewStatus,
+	)
+
+	// --- режим работы ---
 	modeSel = widget.NewRadioGroup([]string{
 		"Только сжатие/конвертация (без обрезки)",
 		"Только обрезка (без пересжатия, быстро, без потери качества)",
@@ -294,8 +450,8 @@ func main() {
 			trimBox.Hide()
 		}
 	})
-	modeSel.SetSelected("Только сжатие/конвертация (без обрезки)")
 
+	// --- настройки сжатия ---
 	resModeSel = widget.NewRadioGroup([]string{
 		"1920x1080 (Full HD)",
 		"1280x720 (HD)",
@@ -340,16 +496,21 @@ func main() {
 		crfLabel.SetText(fmt.Sprintf("Качество (CRF): %.0f  (меньше = лучше качество, больше файл)", v))
 	}
 
-	trimStartEntry = widget.NewEntry()
-	trimStartEntry.SetPlaceHolder("Начало, сек (например 5)")
-	trimEndEntry = widget.NewEntry()
-	trimEndEntry.SetPlaceHolder("Конец, сек (например 15)")
-	trimRow := container.NewGridWithColumns(2, trimStartEntry, trimEndEntry)
+	// --- список фрагментов ---
+	fragmentsListBox = container.NewVBox()
+	addFragmentRow() // одна строка по умолчанию
+
+	addFragmentBtn := widget.NewButton("+ Добавить фрагмент", func() {
+		addFragmentRow()
+	})
+
 	trimNote := widget.NewLabel(
 		"Подсказка: в режиме «без пересжатия» точка обрезки округляется до ближайшего\n" +
 			"опорного кадра (keyframe) — фрагмент может начаться на 1-2 сек раньше/позже\n" +
 			"указанного времени, зато без потери качества. Если нужна точность до кадра —\n" +
-			"выбери режим «И обрезка, и сжатие» (но тогда видео будет пересжато).")
+			"выбери режим «И обрезка, и сжатие» (но тогда видео будет пересжато).\n\n" +
+			"Если фрагментов несколько — для каждого видео получится несколько файлов:\n" +
+			"video_part1, video_part2 и так далее.")
 	trimNote.Wrapping = fyne.TextWrapWord
 
 	progressBar = widget.NewProgressBar()
@@ -378,18 +539,19 @@ func main() {
 	)
 
 	trimBox = container.NewVBox(
-		widget.NewLabel("Обрезка по времени:"),
-		trimRow,
+		widget.NewLabel("Фрагменты для обрезки:"),
+		fragmentsListBox,
+		addFragmentBtn,
 		trimNote,
 	)
-
-	// начальное состояние видимости соответствует выбранному по умолчанию режиму
 	trimBox.Hide()
 
 	content := container.NewVBox(
 		widget.NewLabelWithStyle("RenPy Video Tool", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		fileListLabel,
 		browseBtn,
+		widget.NewSeparator(),
+		previewBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Что нужно сделать:"),
 		modeSel,
