@@ -324,7 +324,7 @@ func processFiles() {
 	step := 0
 	var failed []string
 
-	for i, path := range selectedFiles {
+	for _, path := range selectedFiles {
 		name := filepath.Base(path)
 		baseName := strings.TrimSuffix(name, filepath.Ext(name))
 
@@ -576,3 +576,4 @@ func main() {
 
 	window.ShowAndRun()
 }
+
