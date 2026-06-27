@@ -206,3 +206,23 @@ func runTrimOnly(inputPath, outputPath string, trimStart, trimEnd float64, onPro
 
 	return cmd.Wait()
 }
+
+// extractFrame вытаскивает один кадр на заданной секунде для предпросмотра
+func extractFrame(inputPath string, atSeconds float64, outPath string) error {
+	args := []string{
+		"-y",
+		"-ss", fmt.Sprintf("%.3f", atSeconds),
+		"-i", inputPath,
+		"-frames:v", "1",
+		"-q:v", "2",
+		outPath,
+	}
+	cmd := exec.Command(ffmpegPath(), args...)
+	return cmd.Run()
+}
+
+// openInDefaultPlayer открывает видео в системном плеере по умолчанию (Windows)
+func openInDefaultPlayer(path string) error {
+	cmd := exec.Command("cmd", "/C", "start", "", path)
+	return cmd.Run()
+}
